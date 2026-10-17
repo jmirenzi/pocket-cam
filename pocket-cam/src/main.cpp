@@ -10,6 +10,13 @@
 //   c       capture and print one full-size photo with the BASE settings (also the D0 button)
 //   g       grab a frame and report size + mean brightness (camera test, no printing)
 //   t       print a text test (printer test, no camera)
+//   r <n>   then Enter: send one raw camera frame to the PC, box-resized to n x n
+//           (64..384, or 600 for the unscaled crop). Used by sim/live_view.py.
+//           Reply: "FRM1", u16 width, u16 height (little-endian), then width*height gray bytes.
+//   PBM...  print a 1-bit image sent by the PC (sim/live_view.py). After "PBM": u16 rows,
+//           u8 heat time, u8 label length, label text, rows*48 bitmap bytes (1 = black, MSB =
+//           leftmost dot), u16 sum of the bitmap bytes. All little-endian.
+//           Replies "PRINT OK <rows>" once received, then "PRINT DONE", or "PRINT ERR <why>".
 //
 // Wiring: ESP D6 (TX) -> printer RX, common GND, printer powered separately.
 
@@ -42,7 +49,7 @@ constexpr int STRIP_Y0 = (PRINT_H - STRIP_H) / 2;
 constexpr uint8_t HEAT_DOTS = 5, HEAT_INTERVAL = 2;
 constexpr uint8_t DEFAULT_HEAT_TIME = 110;
 
-constexpr bool CAM_VFLIP = false;
+constexpr bool CAM_VFLIP = true;
 constexpr bool CAM_HMIRROR = false;
 
 constexpr int SRC_SIDE = 600;   // SVGA is 800x600, we use the centered 600x600 square
@@ -70,6 +77,7 @@ static uint8_t *raw1 = nullptr;      // one captured frame, SRC_SIDE x SRC_SIDE
 static uint8_t *rawAvg = nullptr;    // average of AVG_FRAMES captured frames
 static uint16_t *accum = nullptr;    // accumulator for averaging
 static uint8_t *bitmap = nullptr;    // 1-bit output, 1 = burn dot
+static uint8_t *liveSrc = nullptr;   // frame for the PC live view, kept apart from raw1
 static Buffers bufs;
 static bool haveSource = false;
 
@@ -237,6 +245,86 @@ void testGrab() {
   esp_camera_fb_return(fb);
 }
 
+// Send one frame to the PC for sim/live_view.py. n = 600 sends the crop as-is; anything else is
+// box-resized exactly like the print pipeline does, so 384 matches what the BASE settings see.
+void streamFrame(int n) {
+  if (n != SRC_SIDE) n = iclamp(n, 64, PRINT_W);
+  if (!grabInto(liveSrc, nullptr)) {
+    Serial.println("Frame grab failed");
+    return;
+  }
+  const uint8_t *data = liveSrc;
+  if (n != SRC_SIDE) {
+    resizeImage(liveSrc, SRC_SIDE, bufs.scratchA, n, n, R_BOX);
+    data = bufs.scratchA;
+  }
+  const uint8_t hdr[] = {'F', 'R', 'M', '1', (uint8_t)(n & 0xFF), (uint8_t)(n >> 8),
+                         (uint8_t)(n & 0xFF), (uint8_t)(n >> 8)};
+  Serial.write(hdr, sizeof(hdr));
+  Serial.write(data, (size_t)n * n);
+  Serial.flush();
+}
+
+// Read exactly n bytes from USB serial, or give up after timeoutMs without new data.
+static bool readExact(uint8_t *dst, size_t n, uint32_t timeoutMs) {
+  size_t got = 0;
+  uint32_t last = millis();
+  while (got < n) {
+    int avail = Serial.available();
+    if (avail > 0) {
+      got += Serial.read(dst + got, imin(avail, (int)(n - got)));
+      last = millis();
+    } else if (millis() - last > timeoutMs) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
+}
+
+// Print a bitmap the PC already processed (the 'P' of "PBM" has been consumed by handleSerial).
+void printFromPC() {
+  uint8_t hdr[6];  // 'B', 'M', rows lo, rows hi, heat, label length
+  if (!readExact(hdr, sizeof(hdr), 1000) || hdr[0] != 'B' || hdr[1] != 'M') {
+    Serial.println("PRINT ERR bad header");
+    return;
+  }
+  const int rows = hdr[2] | (hdr[3] << 8);
+  const uint8_t heat = hdr[4];
+  const int labelLen = hdr[5];
+  if (rows < 1 || rows > PRINT_H) {
+    Serial.printf("PRINT ERR rows %d\n", rows);
+    return;
+  }
+  char label[256];
+  uint8_t sum[2];
+  if (!readExact((uint8_t *)label, labelLen, 1000) || !readExact(bitmap, (size_t)rows * ROW_BYTES, 1000) ||
+      !readExact(sum, 2, 1000)) {
+    Serial.println("PRINT ERR timeout");
+    return;
+  }
+  label[labelLen] = 0;
+  uint16_t s = 0;
+  for (int i = 0; i < rows * ROW_BYTES; i++) s += bitmap[i];
+  if (s != (uint16_t)(sum[0] | (sum[1] << 8))) {
+    Serial.println("PRINT ERR checksum");
+    return;
+  }
+  Serial.printf("PRINT OK %d\n", rows);
+
+  printerHeat(heat);
+  if (labelLen) {
+    printerFont(1);
+    printerText(label);
+    printerFont(0);
+  }
+  printerRaster(bitmap, rows);
+  printerFeed(4);
+  printerHeat(DEFAULT_HEAT_TIME);
+  Serial.println("PRINT DONE");
+}
+
 // ---------------- Sweep ----------------
 static void printLabel(const Variant &v, int idx, int total, bool full) {
   char line[80];
@@ -318,19 +406,23 @@ static void captureAndPrintBase() {
 }
 
 // ---------------- Arduino ----------------
-static bool awaitingNumber = false;
+static char numberCmd = 0;  // command waiting for its number ('f' or 'r'), 0 = none
 static int numberAcc = 0, numberDigits = 0;
 
 static void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
-    if (awaitingNumber) {
+    if (numberCmd) {
       if (c >= '0' && c <= '9') {
         numberAcc = numberAcc * 10 + (c - '0');
         numberDigits++;
       } else if (c == '\r' || c == '\n') {
-        awaitingNumber = false;
-        if (numberDigits > 0) printFinalist(numberAcc);
+        char cmd = numberCmd;
+        numberCmd = 0;
+        if (numberDigits > 0) {
+          if (cmd == 'f') printFinalist(numberAcc);
+          else streamFrame(numberAcc);
+        }
       }
       continue;
     }
@@ -338,16 +430,22 @@ static void handleSerial() {
     else if (c == 'c') captureAndPrintBase();
     else if (c == 'g') testGrab();
     else if (c == 't') testPrintText();
-    else if (c == 'f') {
-      awaitingNumber = true;
+    else if (c == 'P') printFromPC();
+    else if (c == 'f' || c == 'r') {
+      numberCmd = c;
       numberAcc = 0;
       numberDigits = 0;
-      Serial.println("Variant number, then Enter:");
+      if (c == 'f') Serial.println("Variant number, then Enter:");
     }
   }
 }
 
 void setup() {
+  Serial.setTxBufferSize(16384);  // live view frames are up to 360 KB, a bigger buffer streams faster
+  // HWCDC treats a 100 ms pause in host reads (the default) as a disconnect and drops the rest of
+  // the write, which corrupted live view frames. Allow the PC up to 2 s to catch up.
+  Serial.setTxTimeoutMs(2000);
+  Serial.setRxBufferSize(32768);  // a whole PC print job (up to ~18.5 KB); overflow bytes are dropped
   Serial.begin(115200);
   delay(1500);  // give USB CDC time to enumerate
   Serial.println("\nThermal camera sweep");
@@ -359,11 +457,12 @@ void setup() {
   rawAvg = (uint8_t *)allocBuf((size_t)SRC_SIDE * SRC_SIDE);
   accum = (uint16_t *)allocBuf((size_t)SRC_SIDE * SRC_SIDE * sizeof(uint16_t));
   bitmap = (uint8_t *)allocBuf((size_t)ROW_BYTES * PRINT_H);
+  liveSrc = (uint8_t *)allocBuf((size_t)SRC_SIDE * SRC_SIDE);
   bufs.gray = (uint8_t *)allocBuf(px);
   bufs.scratchA = (uint8_t *)allocBuf(px);
   bufs.scratchB = (uint8_t *)allocBuf(px);
   bufs.bitsSmall = (uint8_t *)allocBuf((size_t)ROW_BYTES * PRINT_H);
-  if (!raw1 || !rawAvg || !accum || !bitmap || !bufs.gray || !bufs.scratchA || !bufs.scratchB || !bufs.bitsSmall) {
+  if (!raw1 || !rawAvg || !accum || !bitmap || !liveSrc || !bufs.gray || !bufs.scratchA || !bufs.scratchB || !bufs.bitsSmall) {
     Serial.println("Out of memory. Check that PSRAM is enabled in platformio.ini.");
     while (true) delay(1000);
   }
