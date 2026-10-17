@@ -31,7 +31,7 @@ static Variant baseVariant() {
   v.clahe = false;
   v.gamma = 1.0f;
   v.avg4 = false;
-  v.heat = 110;
+  v.heat = 250;
   v.coarse = 1;
   return v;
 }
@@ -68,8 +68,8 @@ static void buildSweep() {
   add("4-FRAME AVERAGE").avg4 = true;
 
   // ---- printer heat (BASE_DITHER) ----
-  add("HEAT 80").heat = 80;
-  add("HEAT 140").heat = 140;
+  add("HEAT 180").heat = 180;
+  add("HEAT 255").heat = 255;  // ESC 7 heat time is one byte: 255 is the maximum
 
 #if SWEEP_EXTRA
   add("BAYER 4x4").dither = D_BAYER4;

@@ -14,7 +14,8 @@
 //           (64..384, or 600 for the unscaled crop). Used by sim/live_view.py.
 //           Reply: "FRM1", u16 width, u16 height (little-endian), then width*height gray bytes.
 //   PBM...  print a 1-bit image sent by the PC (sim/live_view.py). After "PBM": u16 rows,
-//           u8 heat time, u8 label length, label text, rows*48 bitmap bytes (1 = black, MSB =
+//           u8 heat time, u8 density (0..31, 0xFF = printer default), u8 label length,
+//           label text, rows*48 bitmap bytes (1 = black, MSB =
 //           leftmost dot), u16 sum of the bitmap bytes. All little-endian.
 //           Replies "PRINT OK <rows>" once received, then "PRINT DONE", or "PRINT ERR <why>".
 //
@@ -47,7 +48,7 @@ constexpr int STRIP_Y0 = (PRINT_H - STRIP_H) / 2;
 
 // ESC 7: n1 = max dots heated at once (units of 8), n3 = heat interval. n2 (heat time) is per variant.
 constexpr uint8_t HEAT_DOTS = 5, HEAT_INTERVAL = 2;
-constexpr uint8_t DEFAULT_HEAT_TIME = 110;
+constexpr uint8_t DEFAULT_HEAT_TIME = 250;
 
 constexpr bool CAM_VFLIP = true;
 constexpr bool CAM_HMIRROR = false;
@@ -93,12 +94,23 @@ void printerHeat(uint8_t heatTime) {
   PrinterSerial.write(cmd, sizeof(cmd));
 }
 
+void printerReset() {
+  const uint8_t init[] = {0x1B, 0x40};  // ESC @ : reset to power-on settings
+  PrinterSerial.write(init, sizeof(init));
+  printerHeat(DEFAULT_HEAT_TIME);
+}
+
 void printerInit() {
   PrinterSerial.begin(PRINTER_BAUD, SERIAL_8N1, PIN_PRINTER_RX, PIN_PRINTER_TX);
   delay(200);
-  const uint8_t init[] = {0x1B, 0x40};  // ESC @ : reset
-  PrinterSerial.write(init, sizeof(init));
-  printerHeat(DEFAULT_HEAT_TIME);
+  printerReset();
+}
+
+// DC2 # n: print density 50% + 5% * (n & 31), break time 250 us * (n >> 5). Darker than heat 255 alone.
+// Not every printer firmware supports it; unsupported printers just ignore it.
+void printerDensity(uint8_t density) {
+  const uint8_t cmd[] = {0x12, 0x23, (uint8_t)((2 << 5) | (density & 31))};
+  PrinterSerial.write(cmd, sizeof(cmd));
 }
 
 void printerFeed(uint8_t lines) {
@@ -285,14 +297,15 @@ static bool readExact(uint8_t *dst, size_t n, uint32_t timeoutMs) {
 
 // Print a bitmap the PC already processed (the 'P' of "PBM" has been consumed by handleSerial).
 void printFromPC() {
-  uint8_t hdr[6];  // 'B', 'M', rows lo, rows hi, heat, label length
+  uint8_t hdr[7];  // 'B', 'M', rows lo, rows hi, heat, density (0xFF = printer default), label length
   if (!readExact(hdr, sizeof(hdr), 1000) || hdr[0] != 'B' || hdr[1] != 'M') {
     Serial.println("PRINT ERR bad header");
     return;
   }
   const int rows = hdr[2] | (hdr[3] << 8);
   const uint8_t heat = hdr[4];
-  const int labelLen = hdr[5];
+  const uint8_t density = hdr[5];
+  const int labelLen = hdr[6];
   if (rows < 1 || rows > PRINT_H) {
     Serial.printf("PRINT ERR rows %d\n", rows);
     return;
@@ -314,6 +327,7 @@ void printFromPC() {
   Serial.printf("PRINT OK %d\n", rows);
 
   printerHeat(heat);
+  if (density != 0xFF) printerDensity(density);
   if (labelLen) {
     printerFont(1);
     printerText(label);
@@ -321,28 +335,48 @@ void printFromPC() {
   }
   printerRaster(bitmap, rows);
   printerFeed(4);
-  printerHeat(DEFAULT_HEAT_TIME);
+  if (density != 0xFF) printerReset();  // back to the power-on density for sweeps and button prints
+  else printerHeat(DEFAULT_HEAT_TIME);
   Serial.println("PRINT DONE");
 }
 
 // ---------------- Sweep ----------------
+// Every setting, " | "-separated and word-wrapped to the 42-character font B line.
+// Same layout as label_lines() in sim/thermal_sim.py so sweep and PC prints read alike.
 static void printLabel(const Variant &v, int idx, int total, bool full) {
-  char line[80];
-  char clip[12];
-  if (v.clip < 0) snprintf(clip, sizeof clip, "off");
-  else snprintf(clip, sizeof clip, "%.0f%%", v.clip * 100.0f);
-  const char *blur = (v.blur == 0) ? "off" : (v.blur == 1 ? "gauss" : "median");
+  static const char *DITHER_LABELS[] = {"threshold", "Bayer 4x4", "Bayer 8x8", "clustered dot", "blue noise",
+                                        "Floyd-Steinberg", "Floyd-Steinberg serp.", "Atkinson", "Sierra Lite",
+                                        "Burkes", "Stucki", "Jarvis-Judice-Ninke"};
+  static const char *BLUR_LABELS[] = {"off", "gaussian 3x3", "median 3x3"};
+  const int LABEL_CHARS = 42;
+  char parts[11][40];
+  snprintf(parts[0], 40, "dither %s", DITHER_LABELS[v.dither]);
+  snprintf(parts[1], 40, "dot %dx%d", v.coarse, v.coarse);
+  snprintf(parts[2], 40, "heat %d", v.heat);
+  snprintf(parts[3], 40, "density default");
+  snprintf(parts[4], 40, "resize %s", resizeName(v.resize));
+  snprintf(parts[5], 40, "blur %s", BLUR_LABELS[v.blur]);
+  snprintf(parts[6], 40, "unsharp %.1f", v.usm);
+  if (v.clip < 0) snprintf(parts[7], 40, "levels off");
+  else snprintf(parts[7], 40, "levels %g%% clip", v.clip * 100.0f);
+  snprintf(parts[8], 40, "contrast %s", v.eq ? "hist. equalize" : (v.clahe ? "CLAHE" : "none"));
+  snprintf(parts[9], 40, "gamma %.2f", v.gamma);
+  snprintf(parts[10], 40, "4-frame avg %s", v.avg4 ? "on" : "off");
 
-  printerFont(1);  // small font so each line fits in 42 characters
+  char line[80];
+  printerFont(1);
   if (total > 0) snprintf(line, sizeof line, "%s%02d/%02d %s", full ? "FULL " : "", idx + 1, total, v.name);
   else snprintf(line, sizeof line, "%s%s", full ? "FULL " : "", v.name);
   printerText(line);
-  snprintf(line, sizeof line, "dither: %s", ditherName(v.dither));
-  printerText(line);
-  snprintf(line, sizeof line, "rs:%s blur:%s usm:%.1f clip:%s", resizeName(v.resize), blur, v.usm, clip);
-  printerText(line);
-  snprintf(line, sizeof line, "eq:%d clahe:%d g:%.1f avg4:%d heat:%d dot:%d", v.eq, v.clahe, v.gamma,
-           v.avg4, v.heat, v.coarse);
+  line[0] = 0;
+  for (int i = 0; i < 11; i++) {
+    if (line[0] && (int)(strlen(line) + 3 + strlen(parts[i])) > LABEL_CHARS) {
+      printerText(line);
+      line[0] = 0;
+    }
+    if (line[0]) strcat(line, " | ");
+    strcat(line, parts[i]);
+  }
   printerText(line);
   printerFont(0);
 }

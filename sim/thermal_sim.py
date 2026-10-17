@@ -64,11 +64,26 @@ class Variant:
     clahe: bool = False
     gamma: float = 1.0
     avg4: bool = False
-    heat: int = 110
+    heat: int = 250      # ESC 7 heat time, 0..255 (one byte, so 255 is the hard maximum)
     coarse: int = 1
+    density: int = -1    # DC2 # print density 0..31 (50% + 5% each), -1 = leave the printer's default
 
 
 BASE = Variant()
+
+# Names used in the UI and on the printed label
+DITHERS = {
+    "THRESH": "threshold", "BAYER4": "Bayer 4x4", "BAYER8": "Bayer 8x8", "CLUSTER8": "clustered dot",
+    "BLUE": "blue noise", "FS": "Floyd-Steinberg", "FS_SERP": "Floyd-Steinberg serp.",
+    "ATKINSON": "Atkinson", "SIERRA_LITE": "Sierra Lite", "BURKES": "Burkes", "STUCKI": "Stucki",
+    "JJN": "Jarvis-Judice-Ninke",
+}
+RESIZES = ["nearest", "box", "bilinear"]
+BLURS = ["off", "gaussian 3x3", "median 3x3"]
+
+
+def density_pct(d):
+    return 100 if d < 0 else 50 + 5 * d
 
 
 def sweep_variants(extra=False):
@@ -87,8 +102,8 @@ def sweep_variants(extra=False):
         replace(b, name="GAMMA 0.8 (LIGHTER)", gamma=0.8),
         replace(b, name="CLAHE LOCAL CONTRAST", clahe=True, clip=-1.0),
         replace(b, name="4-FRAME AVERAGE", avg4=True),
-        replace(b, name="HEAT 80", heat=80),
-        replace(b, name="HEAT 140", heat=140),
+        replace(b, name="HEAT 180", heat=180),
+        replace(b, name="HEAT 255", heat=255),
     ]
     if extra:
         v += [
@@ -382,7 +397,10 @@ def test_scene():
 @dataclass
 class PrintModel:
     ss: int = 6              # render sub-pixels per dot
-    ref_heat: int = 110      # heat time that gives "normal" energy
+    # Energy per dot vs ESC 7 heat time, calibrated to real prints: heat 250 is the sweet spot
+    # (well-formed dots that only just merge); lower heat gives smaller, fainter dots.
+    energy_250: float = 0.91       # energy at heat 250
+    energy_per_heat: float = 0.0021
     dot_gain: float = 0.42   # sideways heat spread in the paper, in dot pitches (sigma)
     threshold: float = 0.42  # energy where the color former is half developed
     softness: float = 0.09   # width of the development curve (smaller = crisper dots)
@@ -405,11 +423,17 @@ def _paper_texture(shape, ss, seed):
     return grain, mottle
 
 
-def simulate_print(bits, heat, m, seed=0):
+def dot_energy(heat, density, m):
+    """Relative energy per dot for an ESC 7 heat time and DC2 # density (-1 = printer default = 100%)."""
+    e = m.energy_250 + m.energy_per_heat * (heat - 250)
+    return max(e, 0.0) * density_pct(density) / 100.0
+
+
+def simulate_print(bits, heat, m, seed=0, density=-1):
     """bits: H x W, 1 = burn. Returns an RGB uint8 image at m.ss pixels per dot."""
     H, W = bits.shape
     b = bits.astype(np.float32)
-    e = heat / m.ref_heat
+    e = dot_energy(heat, density, m)
 
     # energy delivered per element per row, with heat carried from the previous rows
     dep = np.zeros_like(b)
@@ -455,13 +479,30 @@ def font(size):
     return _fonts[size]
 
 
+LABEL_CHARS = 42  # font B characters per line on the 58 mm printer
+
+
+def contrast_name(v):
+    return "hist. equalize" if v.eq else ("CLAHE" if v.clahe else "none")
+
+
 def label_lines(v, idx=None, total=None):
-    clip = "off" if v.clip < 0 else f"{v.clip * 100:.0f}%"
-    blur = ["off", "gauss", "median"][v.blur]
+    """Every setting that shaped the print, word-wrapped to the printer's font B line width."""
     head = f"{idx + 1:02d}/{total:02d} {v.name}" if idx is not None else v.name
-    return [head, f"dither: {v.dither}",
-            f"rs:{v.resize} blur:{blur} usm:{v.usm:.1f} clip:{clip}",
-            f"eq:{int(v.eq)} clahe:{int(v.clahe)} g:{v.gamma:.1f} avg4:{int(v.avg4)} heat:{v.heat} dot:{v.coarse}"]
+    levels = "off" if v.clip < 0 else f"{v.clip * 100:g}% clip"
+    density = "default" if v.density < 0 else f"{density_pct(v.density)}%"
+    parts = [f"dither {DITHERS.get(v.dither, v.dither)}", f"dot {v.coarse}x{v.coarse}",
+             f"heat {v.heat}", f"density {density}", f"resize {v.resize}", f"blur {BLURS[v.blur]}",
+             f"unsharp {v.usm:.1f}", f"levels {levels}", f"contrast {contrast_name(v)}",
+             f"gamma {v.gamma:.2f}", f"4-frame avg {'on' if v.avg4 else 'off'}"]
+    lines, cur = [head[:LABEL_CHARS]], ""
+    for p in parts:
+        if cur and len(cur) + 3 + len(p) > LABEL_CHARS:
+            lines.append(cur)
+            cur = p
+        else:
+            cur = f"{cur} | {p}" if cur else p
+    return lines + [cur]
 
 
 def on_paper(print_rgb, m, text_lines=(), seed=0):
@@ -478,7 +519,7 @@ def on_paper(print_rgb, m, text_lines=(), seed=0):
         d = ImageDraw.Draw(t)
         for i, line in enumerate(text_lines):
             d.text((0, 2 + i * lh // s), line, fill=1, font=font(max(8, lh // s - 3)))
-        txt_rgb = simulate_print(np.asarray(t), m.ref_heat, m, seed + 1)
+        txt_rgb = simulate_print(np.asarray(t), BASE.heat, m, seed + 1)
         canvas.paste(Image.fromarray(txt_rgb), (x0, 0))
     canvas.paste(Image.fromarray(print_rgb), (x0, top))
     return canvas
@@ -508,7 +549,8 @@ def main():
     ap.add_argument("--sag", type=float, default=PrintModel.sag)
     ap.add_argument("--no-band-cool", action="store_true")
     ap.add_argument("--ink", default="52,50,60", help="developed color R,G,B")
-    ap.add_argument("--heat", type=int, help="override every variant's heat time")
+    ap.add_argument("--heat", type=int, help="override every variant's heat time (0..255)")
+    ap.add_argument("--density", type=int, help="override every variant's print density (0..31)")
     ap.add_argument("--gamma", type=float, help="override every variant's gamma (try 0.6-0.8)")
     args = ap.parse_args()
 
@@ -517,9 +559,8 @@ def main():
         for i, v in enumerate(variants):
             print(f"{i + 1:2d}  {v.name}")
         return
-    if args.heat is not None or args.gamma is not None:
-        variants = [replace(v, heat=args.heat if args.heat is not None else v.heat,
-                            gamma=args.gamma if args.gamma is not None else v.gamma) for v in variants]
+    overrides = {k: getattr(args, k) for k in ("heat", "gamma", "density") if getattr(args, k) is not None}
+    variants = [replace(v, **overrides) for v in variants]
 
     m = PrintModel(ss=args.ss, dot_gain=args.dot_gain, threshold=args.threshold, history=args.history,
                    tail=args.tail, sag=args.sag, band_cool=not args.no_band_cool,
@@ -534,7 +575,7 @@ def main():
                 sys.exit(f"variant must be 1..{len(variants)}")
             v = variants[n - 1]
             g, bits = run_pipeline(v, raw_avg if v.avg4 else raw1, blue)
-            sim = simulate_print(bits, v.heat, m, args.seed)
+            sim = simulate_print(bits, v.heat, m, args.seed, v.density)
             page = on_paper(sim, m, label_lines(v, n - 1, len(variants)), args.seed)
             side = Image.new("RGB", (page.width * 2, page.height), (255, 255, 255))
             side.paste(page, (0, 0))
@@ -549,7 +590,7 @@ def main():
     tiles, strips = [], []
     for i, v in enumerate(variants):
         g, bits = run_pipeline(v, raw_avg if v.avg4 else raw1, blue)
-        sim = simulate_print(bits, v.heat, m, args.seed + i)
+        sim = simulate_print(bits, v.heat, m, args.seed + i, v.density)
         print(f"[{i + 1:02d}/{len(variants)}] {v.name:22s} ink coverage {bits.mean() * 100:4.1f}%")
         tile = Image.fromarray(sim)
         d = ImageDraw.Draw(tile)
@@ -557,7 +598,7 @@ def main():
         d.text((6, 4), f"{i + 1}. {v.name}  heat {v.heat}", fill=(200, 0, 0), font=font(18))
         tiles.append(tile)
         strip_bits = bits[STRIP_Y0:STRIP_Y0 + STRIP_H]
-        strips.append(on_paper(simulate_print(strip_bits, v.heat, m, args.seed + i), m,
+        strips.append(on_paper(simulate_print(strip_bits, v.heat, m, args.seed + i, v.density), m,
                                label_lines(v, i, len(variants)), args.seed + i))
 
     cols = 5
